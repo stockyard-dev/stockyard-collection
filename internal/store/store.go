@@ -63,6 +63,12 @@ CREATE TABLE IF NOT EXISTS items (
 	created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS extras (
+	resource TEXT NOT NULL,
+	record_id TEXT NOT NULL,
+	data TEXT NOT NULL DEFAULT '{}',
+	PRIMARY KEY(resource, record_id)
+);
 `
 
 func Open(dataDir string) (*Store, error) {
@@ -84,15 +90,21 @@ func (s *Store) Close() error { return s.db.Close() }
 // ── Categories ────────────────────────────────────────────────────
 
 func (s *Store) CreateCategory(name, color string) (int64, error) {
-	if color == "" { color = "#c45d2c" }
+	if color == "" {
+		color = "#c45d2c"
+	}
 	r, err := s.db.Exec(`INSERT INTO categories (name, color) VALUES (?, ?)`, name, color)
-	if err != nil { return 0, err }
+	if err != nil {
+		return 0, err
+	}
 	return r.LastInsertId()
 }
 
 func (s *Store) ListCategories() ([]Category, error) {
 	rows, err := s.db.Query(`SELECT c.id, c.name, c.color, COUNT(i.id) FROM categories c LEFT JOIN items i ON c.id = i.category_id GROUP BY c.id ORDER BY c.name`)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	defer rows.Close()
 	var cats []Category
 	for rows.Next() {
@@ -120,19 +132,31 @@ func (s *Store) CategoryCount() int {
 func (s *Store) CreateItem(item Item) (int64, error) {
 	r, err := s.db.Exec(`INSERT INTO items (category_id, name, notes, value_cents, rating, location, acquired_date, image_url, field1, field2, field3) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
 		item.CategoryID, item.Name, item.Notes, item.ValueCents, item.Rating, item.Location, item.Acquired, item.ImageURL, item.Field1, item.Field2, item.Field3)
-	if err != nil { return 0, err }
+	if err != nil {
+		return 0, err
+	}
 	return r.LastInsertId()
 }
 
 func (s *Store) ListItems(categoryID int64, search string, limit int) ([]Item, error) {
 	q := `SELECT i.id, i.category_id, COALESCE(c.name,''), i.name, i.notes, i.value_cents, i.rating, i.location, i.acquired_date, i.image_url, i.field1, i.field2, i.field3, i.created_at FROM items i LEFT JOIN categories c ON i.category_id = c.id WHERE 1=1`
 	var args []any
-	if categoryID > 0 { q += ` AND i.category_id = ?`; args = append(args, categoryID) }
-	if search != "" { q += ` AND (i.name LIKE ? OR i.notes LIKE ?)`; args = append(args, "%"+search+"%", "%"+search+"%") }
+	if categoryID > 0 {
+		q += ` AND i.category_id = ?`
+		args = append(args, categoryID)
+	}
+	if search != "" {
+		q += ` AND (i.name LIKE ? OR i.notes LIKE ?)`
+		args = append(args, "%"+search+"%", "%"+search+"%")
+	}
 	q += ` ORDER BY i.name`
-	if limit > 0 { q += fmt.Sprintf(` LIMIT %d`, limit) }
+	if limit > 0 {
+		q += fmt.Sprintf(` LIMIT %d`, limit)
+	}
 	rows, err := s.db.Query(q, args...)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	defer rows.Close()
 	var items []Item
 	for rows.Next() {
@@ -147,7 +171,9 @@ func (s *Store) GetItem(id int64) (*Item, error) {
 	var it Item
 	err := s.db.QueryRow(`SELECT i.id, i.category_id, COALESCE(c.name,''), i.name, i.notes, i.value_cents, i.rating, i.location, i.acquired_date, i.image_url, i.field1, i.field2, i.field3, i.created_at FROM items i LEFT JOIN categories c ON i.category_id = c.id WHERE i.id = ?`, id).
 		Scan(&it.ID, &it.CategoryID, &it.Category, &it.Name, &it.Notes, &it.ValueCents, &it.Rating, &it.Location, &it.Acquired, &it.ImageURL, &it.Field1, &it.Field2, &it.Field3, &it.CreatedAt)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	return &it, nil
 }
 
@@ -174,4 +200,56 @@ func (s *Store) GetStats() Stats {
 	s.db.QueryRow(`SELECT COUNT(*) FROM categories`).Scan(&st.TotalCategories)
 	s.db.QueryRow(`SELECT COALESCE(SUM(value_cents),0) FROM items`).Scan(&st.TotalValueCents)
 	return st
+}
+
+// ─── Extras: generic key-value storage for personalization custom fields ───
+
+func (s *Store) GetExtras(resource, recordID string) string {
+	var data string
+	err := s.db.QueryRow(
+		`SELECT data FROM extras WHERE resource=? AND record_id=?`,
+		resource, recordID,
+	).Scan(&data)
+	if err != nil || data == "" {
+		return "{}"
+	}
+	return data
+}
+
+func (s *Store) SetExtras(resource, recordID, data string) error {
+	if data == "" {
+		data = "{}"
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO extras(resource, record_id, data) VALUES(?, ?, ?)
+		 ON CONFLICT(resource, record_id) DO UPDATE SET data=excluded.data`,
+		resource, recordID, data,
+	)
+	return err
+}
+
+func (s *Store) DeleteExtras(resource, recordID string) error {
+	_, err := s.db.Exec(
+		`DELETE FROM extras WHERE resource=? AND record_id=?`,
+		resource, recordID,
+	)
+	return err
+}
+
+func (s *Store) AllExtras(resource string) map[string]string {
+	out := make(map[string]string)
+	rows, _ := s.db.Query(
+		`SELECT record_id, data FROM extras WHERE resource=?`,
+		resource,
+	)
+	if rows == nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, data string
+		rows.Scan(&id, &data)
+		out[id] = data
+	}
+	return out
 }

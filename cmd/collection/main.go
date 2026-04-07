@@ -4,6 +4,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -16,6 +17,9 @@ import (
 var version = "dev"
 
 func main() {
+	portFlag := flag.Int("port", 0, "HTTP port")
+	dataFlag := flag.String("data", "", "Data directory")
+	flag.Parse()
 	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
 		fmt.Printf("collection %s\n", version)
 		os.Exit(0)
@@ -28,14 +32,26 @@ func main() {
 	log.SetFlags(log.Ltime | log.Lshortfile)
 	port := 8840
 	if p := os.Getenv("PORT"); p != "" {
-		if n, _ := strconv.Atoi(p); n > 0 { port = n }
+		if n, _ := strconv.Atoi(p); n > 0 {
+			port = n
+		}
 	}
 	dataDir := os.Getenv("DATA_DIR")
-	if dataDir == "" { dataDir = "./data" }
+	if dataDir == "" {
+		dataDir = "./data"
+	}
 
+	if *portFlag > 0 {
+		port = *portFlag
+	}
+	if *dataFlag != "" {
+		dataDir = *dataFlag
+	}
 	limits := server.DefaultLimits()
 	db, err := store.Open(dataDir)
-	if err != nil { log.Fatalf("database: %v", err) }
+	if err != nil {
+		log.Fatalf("database: %v", err)
+	}
 	defer db.Close()
 
 	log.Printf("  Questions? hello@stockyard.dev")
@@ -46,6 +62,8 @@ func main() {
 	log.Printf("  Tier:       %s", limits.Tier)
 	log.Printf("")
 
-	srv := server.New(db, port, limits)
-	if err := srv.Start(); err != nil { log.Fatalf("server: %v", err) }
+	srv := server.New(db, port, limits, dataDir)
+	if err := srv.Start(); err != nil {
+		log.Fatalf("server: %v", err)
+	}
 }

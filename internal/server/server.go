@@ -3,21 +3,27 @@ package server
 import (
 	"encoding/json"
 	"fmt"
-	"net/http"
-	"strconv"
-
 	"github.com/stockyard-dev/stockyard-collection/internal/store"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
 )
 
 type Server struct {
-	store  *store.Store
-	port   int
-	limits Limits
-	mux    *http.ServeMux
+	store   *store.Store
+	port    int
+	limits  Limits
+	mux     *http.ServeMux
+	dataDir string
+	pCfg    map[string]json.RawMessage
 }
 
-func New(s *store.Store, port int, limits Limits) *Server {
-	srv := &Server{store: s, port: port, limits: limits, mux: http.NewServeMux()}
+func New(s *store.Store, port int, limits Limits, dataDir string) *Server {
+	srv := &Server{store: s, port: port, limits: limits, mux: http.NewServeMux(), dataDir: dataDir}
+	srv.loadPersonalConfig()
 	srv.routes()
 	return srv
 }
@@ -43,14 +49,23 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /ui", s.hUI)
 	s.mux.HandleFunc("GET /ui/", s.hUI)
 	s.mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" { http.Redirect(w, r, "/ui", 307); return }
+		if r.URL.Path == "/" {
+			http.Redirect(w, r, "/ui", 307)
+			return
+		}
 		http.NotFound(w, r)
 	})
+	s.mux.HandleFunc("GET /api/config", s.configHandler)
+	s.mux.HandleFunc("GET /api/extras/{resource}", s.listExtras)
+	s.mux.HandleFunc("GET /api/extras/{resource}/{id}", s.getExtras)
+	s.mux.HandleFunc("PUT /api/extras/{resource}/{id}", s.putExtras)
 }
 
 func (s *Server) hListCategories(w http.ResponseWriter, r *http.Request) {
 	cats, _ := s.store.ListCategories()
-	if cats == nil { cats = []store.Category{} }
+	if cats == nil {
+		cats = []store.Category{}
+	}
 	j(w, 200, cats)
 }
 
@@ -59,11 +74,20 @@ func (s *Server) hCreateCategory(w http.ResponseWriter, r *http.Request) {
 		j(w, 402, map[string]string{"error": fmt.Sprintf("Free tier limit: %d categories", s.limits.MaxCategories)})
 		return
 	}
-	var body struct{ Name string `json:"name"`; Color string `json:"color"` }
+	var body struct {
+		Name  string `json:"name"`
+		Color string `json:"color"`
+	}
 	json.NewDecoder(r.Body).Decode(&body)
-	if body.Name == "" { j(w, 400, map[string]string{"error": "name required"}); return }
+	if body.Name == "" {
+		j(w, 400, map[string]string{"error": "name required"})
+		return
+	}
 	id, err := s.store.CreateCategory(body.Name, body.Color)
-	if err != nil { j(w, 500, map[string]string{"error": err.Error()}); return }
+	if err != nil {
+		j(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
 	j(w, 201, map[string]any{"id": id, "name": body.Name})
 }
 
@@ -77,9 +101,15 @@ func (s *Server) hListItems(w http.ResponseWriter, r *http.Request) {
 	catID, _ := strconv.ParseInt(r.URL.Query().Get("category_id"), 10, 64)
 	search := r.URL.Query().Get("q")
 	limit := 200
-	if l := r.URL.Query().Get("limit"); l != "" { if n, _ := strconv.Atoi(l); n > 0 { limit = n } }
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if n, _ := strconv.Atoi(l); n > 0 {
+			limit = n
+		}
+	}
 	items, _ := s.store.ListItems(catID, search, limit)
-	if items == nil { items = []store.Item{} }
+	if items == nil {
+		items = []store.Item{}
+	}
 	j(w, 200, items)
 }
 
@@ -90,9 +120,15 @@ func (s *Server) hCreateItem(w http.ResponseWriter, r *http.Request) {
 	}
 	var item store.Item
 	json.NewDecoder(r.Body).Decode(&item)
-	if item.Name == "" { j(w, 400, map[string]string{"error": "name required"}); return }
+	if item.Name == "" {
+		j(w, 400, map[string]string{"error": "name required"})
+		return
+	}
 	id, err := s.store.CreateItem(item)
-	if err != nil { j(w, 500, map[string]string{"error": err.Error()}); return }
+	if err != nil {
+		j(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
 	item.ID = id
 	j(w, 201, item)
 }
@@ -100,7 +136,10 @@ func (s *Server) hCreateItem(w http.ResponseWriter, r *http.Request) {
 func (s *Server) hGetItem(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	item, err := s.store.GetItem(id)
-	if err != nil { j(w, 404, map[string]string{"error": "not found"}); return }
+	if err != nil {
+		j(w, 404, map[string]string{"error": "not found"})
+		return
+	}
 	j(w, 200, item)
 }
 
@@ -168,3 +207,70 @@ function hideAddCat(){document.getElementById('addCatForm').style.display='none'
 async function createItem(){const b={name:document.getElementById('iName').value,category_id:parseInt(document.getElementById('iCat').value)||0,value_cents:Math.round(parseFloat(document.getElementById('iValue').value||'0')*100),location:document.getElementById('iLoc').value,notes:document.getElementById('iNotes').value};if(!b.name){alert('Name required');return}await fetch('/api/items',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});hideAdd();document.getElementById('iName').value='';load()}
 async function createCat(){const n=document.getElementById('cName').value;if(!n)return;await fetch('/api/categories',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})});hideAddCat();document.getElementById('cName').value='';load()}
 load();</script></body></html>`
+
+// ─── personalization (auto-added) ──────────────────────────────────
+
+func (s *Server) loadPersonalConfig() {
+	path := filepath.Join(s.dataDir, "config.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var cfg map[string]json.RawMessage
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		log.Printf("collection: warning: could not parse config.json: %v", err)
+		return
+	}
+	s.pCfg = cfg
+	log.Printf("collection: loaded personalization from %s", path)
+}
+
+func (s *Server) configHandler(w http.ResponseWriter, r *http.Request) {
+	if s.pCfg == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("{}"))
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(s.pCfg)
+}
+
+func (s *Server) listExtras(w http.ResponseWriter, r *http.Request) {
+	resource := r.PathValue("resource")
+	all := s.store.AllExtras(resource)
+	out := make(map[string]json.RawMessage, len(all))
+	for id, data := range all {
+		out[id] = json.RawMessage(data)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
+}
+
+func (s *Server) getExtras(w http.ResponseWriter, r *http.Request) {
+	resource := r.PathValue("resource")
+	id := r.PathValue("id")
+	data := s.store.GetExtras(resource, id)
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(data))
+}
+
+func (s *Server) putExtras(w http.ResponseWriter, r *http.Request) {
+	resource := r.PathValue("resource")
+	id := r.PathValue("id")
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, `{"error":"read body"}`, 400)
+		return
+	}
+	var probe map[string]any
+	if err := json.Unmarshal(body, &probe); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, 400)
+		return
+	}
+	if err := s.store.SetExtras(resource, id, string(body)); err != nil {
+		http.Error(w, `{"error":"save failed"}`, 500)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"ok":"saved"}`))
+}
